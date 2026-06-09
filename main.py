@@ -12,10 +12,12 @@ from PIL import Image
 import numpy as np
 import cv2
 import torch
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision.io import decode_image
 from torchvision.transforms import v2
+import torchvision.models as models
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
 
 """Import Dataset from Drive"""
 
@@ -83,10 +85,13 @@ for path in os.listdir(paths):
   listOfImagesTest.append(path)
   listOfLabelsTest.append(3)
 
+
+classes = ['No Tumor', 'Meningioma', 'Glioma', 'Pituitary']
+
 """Custom Dataset  / DataLoader"""
 
 transform = v2.Compose([
-    v2.Resize((224, 224)),
+    v2.Resize((128, 128)),
     v2.ToTensor()
 ])
 
@@ -106,12 +111,115 @@ class MRIImages(Dataset):
           image = self.transform(image)
         return image, label
 
+
 datasetImagesAndLabels = MRIImages(listOfImagesTrain, listOfLabelsTrain)
-trainLoader = DataLoader(datasetImagesAndLabels, batch_size=64, shuffle=True)
+
+splitRatio = [int(len(datasetImagesAndLabels)*0.8), int(len(datasetImagesAndLabels)*0.2)]
+trainImagesAndLabels, validationImagesAndLabels = random_split(datasetImagesAndLabels, splitRatio)
+
+trainLoader = DataLoader(trainImagesAndLabels, batch_size=64, shuffle=True, drop_last=True)
+validationLoader = DataLoader(validationImagesAndLabels, batch_size=64, shuffle=True, drop_last=True)
 
 datasetImagesAndLabels = MRIImages(listOfImagesTest, listOfLabelsTest)
-testLoader = DataLoader(datasetImagesAndLabels, batch_size=64, shuffle=True)
+testLoader = DataLoader(datasetImagesAndLabels, batch_size=len(datasetImagesAndLabels), shuffle=True, drop_last=True)
 
 for images, labels in trainLoader:
-  print(images.shape)
-  print(labels)
+  #print(images.shape)
+  #print(labels.shape)
+  break
+
+model = models.resnet18(pretrained=True)
+
+numFeatures = model.fc.in_features
+model.fc = torch.nn.Linear(numFeatures, 4)
+
+criterion = torch.nn.CrossEntropyLoss()
+
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=0.0001
+)
+
+trainLoss = []
+validationLoss = []
+numEpochs = 10
+runningLoss = 0
+runningValLoss = 0
+accuracyTrain = 0
+accuracyValidation = 0
+totalTrain = 0
+totalValidation = 0
+
+for epoch in range(numEpochs):
+  print(f'Epoch: {epoch+1}')
+  model.train()
+  for i, data in enumerate(trainLoader):
+    trainImage, trainLabel = data
+    optimizer.zero_grad()
+
+    outputs = model(trainImage)
+    loss = criterion(outputs, trainLabel)
+    loss.backward()
+
+    optimizer.step()
+
+    runningLoss += loss.item()
+    trainLoss.append(loss.item())
+    if len(trainLoss) % 63 == 0:
+      print(f'Train Loss: {trainLoss[-64:]}')
+
+    #print(f"Train Labels: {trainLabel[:20]}")
+    _, predicted = torch.max(outputs,1)
+    #print(f"Train Predicted: {predicted[:20]}")
+    accuracyTrain += accuracy_score(trainLabel, predicted, normalize=False)
+    totalTrain += len(trainLabel)
+
+  model.eval()
+  for i, data in enumerate(validationLoader):
+    validationImage, validationLabel = data
+    with torch.no_grad():
+
+      outputs = model(validationImage)
+      loss = criterion(outputs, validationLabel)
+
+      runningLoss += loss.item()
+      validationLoss.append(loss.item())
+      if len(validationLoss) % 64 == 0:
+        print(f'Validation Loss: {validationLoss[-64:]}')
+
+      #print(f"Validation Labels: {validationLabel[:20]}")
+      _, predicted = torch.max(outputs,1)
+      #print(f"Validation Predicted: {predicted[:20]}")
+      accuracyValidation += accuracy_score(validationLabel, predicted, normalize=False)
+      totalValidation += len(validationLabel)
+
+  print(f'Train Accuracy: {accuracyTrain/totalTrain}')
+  print(f'Validation Accuracy: {accuracyValidation/totalValidation}')
+  torch.save(model.state_dict(), "bestModel.pth")
+
+testCorrect = 0
+testTotal = 0
+for i, data in enumerate(testLoader):
+  testImage, testLabel = data
+
+  with torch.no_grad():
+    outputs = model(testImage)
+
+    #print(f"Test Labels: {testLabel}")
+    _, predicted = torch.max(outputs,1)
+    #print(f"Test Predicted: {predicted}")
+    testCorrect += accuracy_score(testLabel, predicted, normalize=False)
+    testTotal += len(testLabel)
+
+  print(f'Test Accuracy: {testCorrect/testTotal}')
+
+print(classification_report(testLabel, predicted,target_names = classes))
+
+cm = confusion_matrix(testLabel, predicted)
+disp = ConfusionMatrixDisplay(
+    confusion_matrix=cm,
+    display_labels=classes
+)
+
+disp.plot()
+plt.show()
