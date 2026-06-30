@@ -7,6 +7,8 @@ Original file is located at
     https://colab.research.google.com/drive/1fqRF_tANvcvg0jwGm4asxaIu0MiPDxFH
 """
 
+!pip install grad-cam
+
 import os
 from PIL import Image
 import numpy as np
@@ -18,6 +20,10 @@ from torchvision.transforms import v2
 import torchvision.models as models
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 """Import Dataset from Drive"""
 
@@ -91,7 +97,7 @@ classes = ['No Tumor', 'Meningioma', 'Glioma', 'Pituitary']
 """Custom Dataset  / DataLoader"""
 
 transform = v2.Compose([
-    v2.Resize((128, 128)),
+    v2.Resize((224, 224)),
     v2.ToTensor()
 ])
 
@@ -121,7 +127,7 @@ trainLoader = DataLoader(trainImagesAndLabels, batch_size=64, shuffle=True, drop
 validationLoader = DataLoader(validationImagesAndLabels, batch_size=64, shuffle=True, drop_last=True)
 
 datasetImagesAndLabels = MRIImages(listOfImagesTest, listOfLabelsTest)
-testLoader = DataLoader(datasetImagesAndLabels, batch_size=len(datasetImagesAndLabels), shuffle=True, drop_last=True)
+testLoader = DataLoader(datasetImagesAndLabels, batch_size=512, shuffle=True, drop_last=True)
 
 for images, labels in trainLoader:
   #print(images.shape)
@@ -142,7 +148,7 @@ optimizer = torch.optim.Adam(
 
 trainLoss = []
 validationLoss = []
-numEpochs = 10
+numEpochs = 2
 runningLoss = 0
 runningValLoss = 0
 accuracyTrain = 0
@@ -195,7 +201,7 @@ for epoch in range(numEpochs):
 
   print(f'Train Accuracy: {accuracyTrain/totalTrain}')
   print(f'Validation Accuracy: {accuracyValidation/totalValidation}')
-  torch.save(model.state_dict(), "bestModel.pth")
+  torch.save(model.state_dict(), "/content/drive/MyDrive/bestModelBrain.pth")
 
 testCorrect = 0
 testTotal = 0
@@ -211,8 +217,9 @@ for i, data in enumerate(testLoader):
     testCorrect += accuracy_score(testLabel, predicted, normalize=False)
     testTotal += len(testLabel)
 
-  print(f'Test Accuracy: {testCorrect/testTotal}')
+print(f'Test Accuracy: {testCorrect/testTotal}')
 
+reportDict = classification_report(testLabel, predicted,target_names = classes, output_dict=False)
 print(classification_report(testLabel, predicted,target_names = classes))
 
 cm = confusion_matrix(testLabel, predicted)
@@ -223,3 +230,109 @@ disp = ConfusionMatrixDisplay(
 
 disp.plot()
 plt.show()
+
+"""Grad-CAM"""
+
+images, labels = next(iter(testLoader))
+
+testImage = images[0]
+label = labels[0]
+
+outputs = model(testImage.unsqueeze(0))
+_, predictedClass = torch.max(outputs,1)
+targets = [ClassifierOutputTarget(predictedClass)]
+
+layers = [model.layer4[-1]]
+cam = GradCAM(model = model, target_layers = layers)
+heatmap = cam(input_tensor = testImage.unsqueeze(0), targets = targets)
+
+print(f'True: {label}, Predicted: {predictedClass}')
+
+testImage = testImage.permute(1, 2, 0).cpu().numpy()
+testImage = (testImage - testImage.min()) / (testImage.max() - testImage.min())
+heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min())
+visualization = show_cam_on_image(
+    testImage,
+    heatmap[0],
+    use_rgb=True
+)
+
+plt.imshow(visualization, cmap='jet')
+plt.colorbar()
+plt.axis('off')
+
+"""
+  fig, ax = plt.subplots(1,2,figsize=(10,5))
+
+  ax[0].imshow(testImage)
+
+  ax[1].imshow(heatmap)
+  ax[1].set_title("GradCAM Heatmap")
+  """
+
+"""LLM"""
+
+modelName = "Qwen/Qwen2.5-0.5B-Instruct"
+
+modelLLM = AutoModelForCausalLM.from_pretrained(
+    modelName,
+    torch_dtype="auto",
+    device_map="auto"
+)
+
+tokenizer = AutoTokenizer.from_pretrained(modelName)
+
+if label.item() == 0:
+  reportDictClass = classification_report(testLabel, predicted,labels = [0], target_names=classes, output_dict=False)
+elif label.item() == 1:
+  reportDictClass = classification_report(testLabel, predicted,labels = [1], target_names=classes,output_dict=False)
+elif label.item() == 2:
+  reportDictClass = classification_report(testLabel, predicted,labels = [2], target_names=classes,output_dict=False)
+elif label.item() == 3:
+  reportDictClass = classification_report(testLabel, predicted,labels = [3], target_names=classes,output_dict=False)
+
+prompt = f"""
+              The Prediction and True Labels are mapped 0 has no Tumor, 1 is a Meningioma, 2 is a Glioma, 3 is a Pituitary
+              These labels are NOT to be interpreted as severity of tumour, if present
+
+              Model Preformance: {reportDictClass}, use this as supporting information and only incorperate numerical values
+              What the Model Predicted: {predictedClass}
+              What the True Value: {label.item()}
+              Values between 0.7 and 1 are considered high/good
+
+              Be Consistant in reporting
+              Do not relate the model preformance with with the model predicted or true value.
+              Do not mention any terms that have not been provided
+              Do not assume that if there are significant values in image2 there is a lesion
+              Use the actual values in your explination
+
+              Explain why the CNN may have made this prediction & where the tumour, if present, is within the brain using image1 and image2 and neuroanatomy terminology. Do not give general information about AI.
+
+              Limit to 6 sentances
+              """
+messages = [
+    {"role": "system", "content": "You are an board certified neuroradiologist reading an MRI."},
+    {"type": "image", "image1": testImage},
+    {"type": "image", "image2": heatmap},
+    {"role": "user", "content": prompt},
+]
+
+text = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+
+model_inputs = tokenizer([text], return_tensors="pt").to(modelLLM.device)
+
+generated_ids = modelLLM.generate(
+    **model_inputs,
+    max_new_tokens=512
+)
+generated_ids = [
+    output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+]
+
+response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+print(response)
